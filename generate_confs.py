@@ -1,185 +1,760 @@
 from argparse import ArgumentParser
+
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
+
+from rdkit.Chem import AllChem
+
 import pickle
 import pandas as pd
 from tqdm import tqdm
+
 import yaml
+import os
 import os.path as osp
+import numpy as np
+import torch
 
 from utils.utils import get_model
 from diffusion.sampling import *
 
-parser = ArgumentParser()
-parser.add_argument('--model_dir', type=str, required=True, help='Path to folder with trained model and hyperparameters')
-parser.add_argument('--ckpt', type=str, default='best_model.pt', help='Checkpoint to use inside the folder')
-parser.add_argument('--out', type=str, help='Path to the output pickle file')
-parser.add_argument('--test_csv', type=str, default='./data/DRUGS/test_smiles.csv', help='Path to csv file with list of smiles and number conformers')
-parser.add_argument('--pre_mmff', action='store_true', default=False, help='Whether to run MMFF on the local structure conformer')
-parser.add_argument('--post_mmff', action='store_true', default=False, help='Whether to run MMFF on the final generated structures')
-parser.add_argument('--no_random', action='store_true', default=False, help='Whether avoid randomising the torsions of the seed conformer')
-parser.add_argument('--no_model', action='store_true', default=False, help='Whether to return seed conformer without running model')
-parser.add_argument('--seed_confs', default=None, help='Path to directly specify the seed conformers')
-parser.add_argument('--seed_mols', default=None, help='Path to directly specify the seed molecules (instead of from SMILE)')
-parser.add_argument('--single_conf', action='store_true', default=False, help='Whether to start from a single local structure')
-parser.add_argument('--inference_steps', type=int, default=20, help='Number of denoising steps')
-parser.add_argument('--limit_mols', type=int, default=None, help='Limit to the number of molecules')
-parser.add_argument('--confs_per_mol', type=int, default=None, help='If set for every molecule this number of conformers is generated, '
-                                                                    'otherwise 2x the number in the csv file')
-parser.add_argument('--ode', action='store_true', default=False, help='Whether to run the probability flow ODE instead of the SDE')
-parser.add_argument('--likelihood', choices=['full', 'hutch'], default=None, help='Technique to compute likelihood')
-parser.add_argument('--dump_pymol', type=str, default=None, help='Whether to save .pdb file with denoising dynamics')
-parser.add_argument('--tqdm', action='store_true', default=False, help='Whether to show progress bar')
-parser.add_argument('--water', action='store_true', default=False, help='Whether to compute xTB energy in water')
-parser.add_argument('--batch_size', type=int, default=32, help='Number of conformers generated in parallel')
-parser.add_argument('--xtb', type=str, default=None, help='If set, it indicates path to local xtb main directory')
-parser.add_argument('--no_energy', action='store_true', default=False, help='If set skips computation of likelihood, energy etc')
 
-parser.add_argument('--pg_weight_log_0', type=float, default=None)
-parser.add_argument('--pg_weight_log_1', type=float, default=None)
-parser.add_argument('--pg_repulsive_weight_log_0', type=float, default=None)
-parser.add_argument('--pg_repulsive_weight_log_1', type=float, default=None)
-parser.add_argument('--pg_langevin_weight_log_0', type=float, default=None)
-parser.add_argument('--pg_langevin_weight_log_1', type=float, default=None)
-parser.add_argument('--pg_kernel_size_log_0', type=float, default=None)
-parser.add_argument('--pg_kernel_size_log_1', type=float, default=None)
-parser.add_argument('--pg_invariant', type=bool, default=False)
+# ============================================================
+# Argument parser
+# ============================================================
+
+parser = ArgumentParser()
+
+parser.add_argument(
+    '--model_dir',
+    type=str,
+    required=True,
+    help='Path to folder with trained model and hyperparameters'
+)
+
+parser.add_argument(
+    '--ckpt',
+    type=str,
+    default='best_model.pt',
+    help='Checkpoint to use inside the folder'
+)
+
+parser.add_argument(
+    '--out',
+    type=str,
+    required=True,
+    help='Path to output pickle file'
+)
+
+parser.add_argument(
+    '--test_csv',
+    type=str,
+    default='./data/DRUGS/test_smiles.csv',
+    help='CSV containing SMILES and number of conformers'
+)
+
+
+# ============================================================
+# Molecular initialization
+# ============================================================
+
+parser.add_argument(
+    '--pre_mmff',
+    action='store_true',
+    default=False,
+    help='Run MMFF on the initial seed conformer'
+)
+
+parser.add_argument(
+    '--post_mmff',
+    action='store_true',
+    default=False,
+    help='Run MMFF on the final generated conformers'
+)
+
+parser.add_argument(
+    '--no_random',
+    action='store_true',
+    default=False,
+    help='Do not randomly perturb the seed torsions'
+)
+
+parser.add_argument(
+    '--no_model',
+    action='store_true',
+    default=False,
+    help='Return seed conformers without running the model'
+)
+
+parser.add_argument(
+    '--seed_confs',
+    default=None,
+    help='Path to seed conformers pickle'
+)
+
+parser.add_argument(
+    '--seed_mols',
+    default=None,
+    help='Path to seed molecules pickle'
+)
+
+parser.add_argument(
+    '--single_conf',
+    action='store_true',
+    default=False,
+    help='Start every sample from the same local structure'
+)
+
+
+# ============================================================
+# DDDM sampling
+# ============================================================
+
+parser.add_argument(
+    '--dddm_steps',
+    type=int,
+    default=20,
+    help='Number of DDDM denoising iterations'
+)
+
+
+# ============================================================
+# Dataset / generation size
+# ============================================================
+
+parser.add_argument(
+    '--limit_mols',
+    type=int,
+    default=None,
+    help='Limit number of molecules'
+)
+
+parser.add_argument(
+    '--confs_per_mol',
+    type=int,
+    default=None,
+    help=(
+        'Number of conformers generated per molecule. '
+        'If not specified, generate 2x the number in the CSV.'
+    )
+)
+
+
+# ============================================================
+# Output / runtime
+# ============================================================
+
+parser.add_argument(
+    '--dump_pymol',
+    type=str,
+    default=None,
+    help='Directory for PDB denoising trajectories'
+)
+
+parser.add_argument(
+    '--tqdm',
+    action='store_true',
+    default=False,
+    help='Show progress bar'
+)
+
+parser.add_argument(
+    '--batch_size',
+    type=int,
+    default=32,
+    help='Number of conformers processed in parallel'
+)
+
+
+# ============================================================
+# Energy / likelihood
+# ============================================================
+
+parser.add_argument(
+    '--water',
+    action='store_true',
+    default=False,
+    help='Compute xTB energy in water'
+)
+
+parser.add_argument(
+    '--xtb',
+    type=str,
+    default=None,
+    help='Path to local xTB installation'
+)
+
+parser.add_argument(
+    '--no_energy',
+    action='store_true',
+    default=False,
+    help='Skip likelihood / energy calculations'
+)
+
+
+# ============================================================
+# DDDM model arguments
+# ============================================================
+
+parser.add_argument(
+    '--condition',
+    type=str,
+    default=None,
+    help=(
+        'Optional path to conditioning tensor. '
+        'Only needed if the DDDM model is conditional.'
+    )
+)
+
+
 args = parser.parse_args()
 
-"""
-    Generates conformers for a list of molecules' SMILE given a trained model
-    Saves a pickle with dictionary with the SMILE as key and the RDKit molecules with generated conformers as value 
-"""
 
-if args.likelihood:
-    assert args.ode or args.no_model
+# ============================================================
+# Basic validation
+# ============================================================
 
+if args.dddm_steps <= 0:
+    raise ValueError(
+        f'--dddm_steps must be > 0, got {args.dddm_steps}'
+    )
+
+
+# ============================================================
+# Device
+# ============================================================
+
+device = torch.device(
+    'cuda' if torch.cuda.is_available() else 'cpu'
+)
+
+batch_size = args.batch_size
+
+print('Device:', device)
+print('DDDM sampling steps:', args.dddm_steps)
+print('Batch size:', batch_size)
+
+
+# ============================================================
+# RDKit embedding
+# ============================================================
 
 def embed_func(mol, numConfs):
-    AllChem.EmbedMultipleConfs(mol, numConfs=numConfs, numThreads=5)
+
+    AllChem.EmbedMultipleConfs(
+        mol,
+        numConfs=numConfs,
+        numThreads=5
+    )
+
     return mol
 
 
-still_frames = 10
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-batch_size = args.batch_size
+# ============================================================
+# Load seed conformers / molecules
+# ============================================================
+
+seed_confs = None
 
 if args.seed_confs:
-    print("Using local structures from", args.seed_confs)
+
+    print(
+        'Using local structures from',
+        args.seed_confs
+    )
+
     with open(args.seed_confs, 'rb') as f:
         seed_confs = pickle.load(f)
+
 elif args.seed_mols:
-    print("Using molecules from", args.seed_mols)
+
+    print(
+        'Using molecules from',
+        args.seed_mols
+    )
+
     with open(args.seed_mols, 'rb') as f:
         seed_confs = pickle.load(f)
 
-with open(f'{args.model_dir}/model_parameters.yml') as f:
-    args.__dict__.update(yaml.full_load(f))
-args.batch_size = batch_size  # override the training one
+
+# ============================================================
+# Load model hyperparameters
+# ============================================================
+
+with open(
+    f'{args.model_dir}/model_parameters.yml'
+) as f:
+
+    model_params = yaml.full_load(f)
+
+
+# Add YAML parameters to argparse namespace.
+
+args.__dict__.update(model_params)
+
+# Keep command-line batch size.
+
+args.batch_size = batch_size
+
+
+# ============================================================
+# Load DDDM model
+# ============================================================
+
+model = None
+
 if not args.no_model:
+
+    print('Loading model...')
+
     model = get_model(args)
-    state_dict = torch.load(f'{args.model_dir}/{args.ckpt}', map_location=torch.device('cpu'))
-    model.load_state_dict(state_dict, strict=True)
+
+    checkpoint_path = (
+        f'{args.model_dir}/{args.ckpt}'
+    )
+
+    print(
+        'Loading checkpoint:',
+        checkpoint_path
+    )
+
+    state_dict = torch.load(
+        checkpoint_path,
+        map_location=torch.device('cpu')
+    )
+
+    model.load_state_dict(
+        state_dict,
+        strict=True
+    )
+
     model = model.to(device)
+
     model.eval()
 
-test_data = pd.read_csv(args.test_csv).values
-if args.limit_mols:
-    test_data = test_data[:args.limit_mols]
+    print('Model loaded successfully.')
 
-conformer_dict = {}
+
+# ============================================================
+# Optional condition
+# ============================================================
+
+condition = None
+
+if args.condition is not None:
+
+    print(
+        'Loading DDDM condition from',
+        args.condition
+    )
+
+    condition = torch.load(
+        args.condition,
+        map_location=device
+    )
+
+    if isinstance(condition, np.ndarray):
+        condition = torch.from_numpy(condition)
+
+    condition = condition.to(
+        device=device,
+        dtype=torch.float32
+    )
+
+
+# ============================================================
+# Load test molecules
+# ============================================================
+
+test_data = pd.read_csv(
+    args.test_csv
+).values
+
+if args.limit_mols is not None:
+
+    test_data = test_data[
+        :args.limit_mols
+    ]
+
+print(
+    'Number of molecules:',
+    len(test_data)
+)
+
+
+# ============================================================
+# Progress bar
+# ============================================================
+
 if args.tqdm:
-    test_data = tqdm(enumerate(test_data), total=len(test_data))
+
+    test_data = tqdm(
+        enumerate(test_data),
+        total=len(test_data)
+    )
+
 else:
+
     test_data = enumerate(test_data)
 
 
-def sample_confs(raw_smi, n_confs, smi):
-    print(raw_smi)
+# ============================================================
+# Generate conformers for one molecule
+# ============================================================
+
+def sample_confs(
+    raw_smi,
+    n_confs,
+    smi,
+    smi_idx
+):
+
+    print(
+        '\nGenerating:',
+        smi
+    )
+
+    print(
+        'Number of conformers:',
+        n_confs
+    )
+
+    # --------------------------------------------------------
+    # Get molecular seed
+    # --------------------------------------------------------
+
     if args.seed_confs:
-        mol, data = get_seed(raw_smi, seed_confs=seed_confs, dataset=args.dataset)
+
+        mol, data = get_seed(
+            raw_smi,
+            seed_confs=seed_confs,
+            dataset=args.dataset
+        )
+
     elif args.seed_mols:
-        mol, data = get_seed(smi, seed_confs=seed_confs, dataset=args.dataset)
-        mol.RemoveAllConformers()
+
+        mol, data = get_seed(
+            smi,
+            seed_confs=seed_confs,
+            dataset=args.dataset
+        )
+
+        if mol is not None:
+            mol.RemoveAllConformers()
+
     else:
-        mol, data = get_seed(smi, dataset=args.dataset)
-    if not mol:
-        print('Failed to get seed', smi)
+
+        mol, data = get_seed(
+            smi,
+            dataset=args.dataset
+        )
+
+    if mol is None:
+
+        print(
+            'Failed to get seed:',
+            smi
+        )
+
         return None
 
-    n_rotable_bonds = int(data.edge_mask.sum())
+    # --------------------------------------------------------
+    # Number of rotatable bonds
+    # --------------------------------------------------------
+
+    n_rotable_bonds = int(
+        data.edge_mask.sum()
+    )
+
+    print(
+        'Rotatable bonds:',
+        n_rotable_bonds
+    )
+
+    # --------------------------------------------------------
+    # Generate initial conformers
+    # --------------------------------------------------------
+
     if args.seed_confs:
-        conformers, pdb = embed_seeds(mol, data, n_confs, single_conf=args.single_conf, smi=raw_smi,
-                                      pdb=args.dump_pymol, seed_confs=seed_confs)
+
+        conformers, pdb = embed_seeds(
+            mol,
+            data,
+            n_confs,
+            single_conf=args.single_conf,
+            smi=raw_smi,
+            pdb=args.dump_pymol,
+            seed_confs=seed_confs
+        )
+
     else:
-        conformers, pdb = embed_seeds(mol, data, n_confs, single_conf=args.single_conf,
-                                      pdb=args.dump_pymol, embed_func=embed_func, mmff=args.pre_mmff)
+
+        conformers, pdb = embed_seeds(
+            mol,
+            data,
+            n_confs,
+            single_conf=args.single_conf,
+            pdb=args.dump_pymol,
+            embed_func=embed_func,
+            mmff=args.pre_mmff
+        )
+
     if not conformers:
-        print("Failed to embed", smi)
+
+        print(
+            'Failed to embed:',
+            smi
+        )
+
         return None
 
-    if not args.no_random and n_rotable_bonds > 0.5:
-        conformers = perturb_seeds(conformers, pdb)
+    # --------------------------------------------------------
+    # Randomly perturb seed torsions
+    # --------------------------------------------------------
 
-    if not args.no_model and n_rotable_bonds > 0.5:
-        conformers = sample(conformers, model, args.sigma_max, args.sigma_min, args.inference_steps,
-                            args.batch_size, args.ode, args.likelihood, pdb,
-                            pg_weight_log_0=args.pg_weight_log_0, pg_weight_log_1=args.pg_weight_log_1,
-                            pg_repulsive_weight_log_0=args.pg_repulsive_weight_log_0,
-                            pg_repulsive_weight_log_1=args.pg_repulsive_weight_log_1,
-                            pg_kernel_size_log_0=args.pg_kernel_size_log_0,
-                            pg_kernel_size_log_1=args.pg_kernel_size_log_1,
-                            pg_langevin_weight_log_0=args.pg_langevin_weight_log_0,
-                            pg_langevin_weight_log_1=args.pg_langevin_weight_log_1,
-                            pg_invariant=args.pg_invariant, mol=mol)
+    if (
+        not args.no_random
+        and n_rotable_bonds > 0
+    ):
 
-    if args.dump_pymol:
-        if not osp.isdir(args.dump_pymol):
-            os.mkdir(args.dump_pymol)
-        pdb.write(f'{args.dump_pymol}/{smi_idx}.pdb', limit_parts=5)
+        conformers = perturb_seeds(
+            conformers,
+            pdb
+        )
 
-    mols = [pyg_to_mol(mol, conf, args.post_mmff, rmsd=not args.no_energy) for conf in conformers]
-    if args.likelihood:
-        if n_rotable_bonds < 0.5:
-            print(f"Skipping mol {smi} with 0 rotable bonds")
-            return None
-    for mol, data in zip(mols, conformers):
-        populate_likelihood(mol, data, water=args.water, xtb=args.xtb)
+    # --------------------------------------------------------
+    # DDDM sampling
+    # --------------------------------------------------------
+
+    if (
+        not args.no_model
+        and n_rotable_bonds > 0
+    ):
+
+        print(
+            f'Running DDDM for '
+            f'{args.dddm_steps} steps...'
+        )
+
+        conformers = sample_dddm(
+            conformers=conformers,
+            model=model,
+            num_steps=args.dddm_steps,
+            batch_size=args.batch_size,
+            pdb=pdb,
+            mol=mol,
+            condition=condition,
+            model_kwargs=None
+        )
+
+    elif not args.no_model:
+
+        print(
+            'Molecule has 0 rotatable bonds. '
+            'Skipping DDDM sampling.'
+        )
+
+    # --------------------------------------------------------
+    # PDB output
+    # --------------------------------------------------------
+
+    if args.dump_pymol and pdb is not None:
+
+        if not osp.isdir(
+            args.dump_pymol
+        ):
+
+            os.makedirs(
+                args.dump_pymol,
+                exist_ok=True
+            )
+
+        pdb.write(
+            f'{args.dump_pymol}/{smi_idx}.pdb',
+            limit_parts=5
+        )
+
+    # --------------------------------------------------------
+    # Convert PyG conformers to RDKit molecules
+    # --------------------------------------------------------
+
+    mols = []
+
+    for conf in conformers:
+
+        generated_mol = pyg_to_mol(
+            mol,
+            conf,
+            mmff=args.post_mmff,
+            rmsd=not args.no_energy
+        )
+
+        mols.append(
+            generated_mol
+        )
+
+    # --------------------------------------------------------
+    # Energy / likelihood
+    # --------------------------------------------------------
+
+    #
+    # IMPORTANT:
+    #
+    # The current DDDM sampler does not calculate dlogp.
+    #
+    # Therefore likelihood/free-energy calculation from
+    # the original score-based sampler should NOT be called
+    # unless you explicitly implement DDDM likelihood.
+    #
+
+    if not args.no_energy:
+
+        print(
+            'WARNING: --no_energy is recommended for the '
+            'current DDDM sampler because DDDM does not '
+            'populate euclidean_dlogp.'
+        )
+
+        try:
+
+            for generated_mol, conf in zip(
+                mols,
+                conformers
+            ):
+
+                populate_likelihood(
+                    generated_mol,
+                    conf,
+                    water=args.water,
+                    xtb=args.xtb
+                )
+
+        except Exception as e:
+
+            print(
+                'Energy/likelihood calculation failed:',
+                e
+            )
+
+            print(
+                'Continuing without energy filtering.'
+            )
+
+    # --------------------------------------------------------
+    # xTB filtering
+    # --------------------------------------------------------
 
     if args.xtb:
-        mols = [mol for mol in mols if mol.xtb_energy]
+
+        mols = [
+            mol
+            for mol in mols
+            if hasattr(mol, 'xtb_energy')
+            and mol.xtb_energy is not None
+        ]
+
     return mols
 
 
-for smi_idx, (raw_smi, n_confs, smi) in test_data:
-    if type(args.confs_per_mol) is int:
-        mols = sample_confs(raw_smi, args.confs_per_mol, smi)
+# ============================================================
+# Main generation loop
+# ============================================================
+
+conformer_dict = {}
+
+
+for smi_idx, (
+    raw_smi,
+    n_confs,
+    smi
+) in test_data:
+
+    # --------------------------------------------------------
+    # Determine number of conformers
+    # --------------------------------------------------------
+
+    if args.confs_per_mol is not None:
+
+        n_generate = args.confs_per_mol
+
     else:
-        mols = sample_confs(raw_smi, 2 * n_confs, smi)
-    if not mols: continue
-    if not args.no_energy:
-        rmsd = [mol.rmsd for mol in mols]
-        dlogp = np.array([mol.euclidean_dlogp for mol in mols])
-        if args.xtb:
-            energy = np.array([mol.xtb_energy for mol in mols])
-        else:
-            energy = np.array([mol.mmff_energy for mol in mols])
-        F, F_std = (0, 0) if args.no_energy else free_energy(dlogp, energy)
+
+        n_generate = 2 * int(n_confs)
+
+    # --------------------------------------------------------
+    # Generate
+    # --------------------------------------------------------
+
+    mols = sample_confs(
+        raw_smi=raw_smi,
+        n_confs=n_generate,
+        smi=smi,
+        smi_idx=smi_idx
+    )
+
+    if not mols:
+
         print(
-            f'{smi_idx} rotable_bonds={mols[0].n_rotable_bonds} n_confs={len(rmsd)}',
-            f'rmsd={np.mean(rmsd):.2f}',
-            f'F={F:.2f}+/-{F_std:.2f}',
-            f'energy {np.mean(energy):.2f}+/-{bootstrap((energy,), np.mean).standard_error:.2f}',
-            f'dlogp {np.mean(dlogp):.2f}+/-{bootstrap((dlogp,), np.mean).standard_error:.2f}',
-            smi,
-            flush=True
+            f'Skipping molecule {smi}'
         )
-    else:
-        print(f'{smi_idx} rotable_bonds={mols[0].n_rotable_bonds} n_confs={len(mols)}', smi, flush=True)
+
+        continue
+
+    # --------------------------------------------------------
+    # Print basic information
+    # --------------------------------------------------------
+
+    print(
+        f'{smi_idx} '
+        f'rotable_bonds={mols[0].n_rotable_bonds} '
+        f'n_confs={len(mols)} '
+        f'dddm_steps={args.dddm_steps} '
+        f'{smi}',
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # Store generated conformers
+    # --------------------------------------------------------
+
     conformer_dict[smi] = mols
 
-# save to file
+
+# ============================================================
+# Save generated conformers
+# ============================================================
+
 if args.out:
-    with open(f'{args.out}', 'wb') as f:
-        pickle.dump(conformer_dict, f)
-print('Generated conformers for', len(conformer_dict), 'molecules')
+
+    output_dir = osp.dirname(
+        args.out
+    )
+
+    if output_dir:
+
+        os.makedirs(
+            output_dir,
+            exist_ok=True
+        )
+
+    with open(
+        args.out,
+        'wb'
+    ) as f:
+
+        pickle.dump(
+            conformer_dict,
+            f
+        )
+
+    print(
+        '\nSaved generated conformers to:',
+        args.out
+    )
+
+
+print(
+    'Generated conformers for',
+    len(conformer_dict),
+    'molecules'
+)
