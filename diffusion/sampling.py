@@ -25,10 +25,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 still_frames = 10
 
 
-# ============================================================
-# MMFF
-# ============================================================
-
 def try_mmff(mol):
     try:
         AllChem.MMFFOptimizeMoleculeConfs(
@@ -39,10 +35,6 @@ def try_mmff(mol):
     except Exception:
         return False
 
-
-# ============================================================
-# Seed generation
-# ============================================================
 
 def get_seed(smi, seed_confs=None, dataset="drugs"):
 
@@ -71,10 +63,6 @@ def get_seed(smi, seed_confs=None, dataset="drugs"):
 
     return mol, data
 
-
-# ============================================================
-# Embed seeds
-# ============================================================
 
 def embed_seeds(
     mol,
@@ -197,10 +185,6 @@ def embed_seeds(
     return conformers, pdb
 
 
-# ============================================================
-# Perturb initial conformers
-# ============================================================
-
 def perturb_seeds(data, pdb=None):
 
     for i, data_conf in enumerate(data):
@@ -233,10 +217,6 @@ def perturb_seeds(data, pdb=None):
 
     return data
 
-
-# ============================================================
-# Helper: calculate current torsion angles
-# ============================================================
 
 def get_current_torsions(data, device):
 
@@ -309,9 +289,6 @@ def get_current_torsions(data, device):
     return tau.squeeze(0), dihedral
 
 
-# ============================================================
-# DDDM molecular sampler
-# ============================================================
 
 def sample_dddm(
     conformers,
